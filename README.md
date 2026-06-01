@@ -1,14 +1,14 @@
 # userlogger
 
-Go 业务日志库，用于记录面向用户的操作过程日志。
+A Go logging library for user-facing operation logs with scope grouping, span timing, klog dual-write, and async batched writes.
 
 ## Features
 
-- `UserLogger` 核心接口，支持普通日志、格式化日志、错误日志和 `Flush`
-- `async.AsyncLogger` 提供非阻塞异步批量写入
-- `scoped` 支持业务 scope 前缀，便于区分并发任务日志
-- `span` 支持操作耗时追踪
-- 自动兼容 `klog` context，可同时写用户日志和系统日志
+- `UserLogger` core interface with plain, formatted, and error log methods plus `Flush`
+- `async.AsyncLogger` — non-blocking, channel-based batched writes
+- `scoped` — scope prefix decorator for grouping logs by business context
+- `span` — operation duration tracking
+- Automatic `klog` dual-write when a `klog.Logger` is present in context
 
 ## Install
 
@@ -31,7 +31,7 @@ sp := ul.StartSpan("deploy application")
 defer sp.Done()
 ```
 
-`writer` 需要实现：
+`writer` must implement:
 
 ```go
 type LogWriter interface {
@@ -41,21 +41,21 @@ type LogWriter interface {
 
 ## Packages
 
-- `userlogger`: 核心接口、context helper、klog 双写
-- `async`: 异步批量写入实现
-- `scoped`: scope 前缀装饰器
-- `span`: 耗时追踪实现
+- `userlogger` — core interfaces, context helpers, klog dual-write
+- `async` — async batched writer implementation
+- `scoped` — scope prefix decorator
+- `span` — timed span implementation
 
 ## Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `ChannelBufferCount` | `10000` | channel 容量 |
-| `BatchSize` | `50` | 批量写入条数 |
-| `FlushInterval` | `3s` | 定时刷盘间隔 |
-| `MaxRetry` | `3` | 写入重试次数，`0` 表示不重试 |
-| `WriteTimeout` | `5s` | 单次写入超时 |
-| `CloseTimeout` | `10s` | 关闭等待超时 |
+| `ChannelBufferCount` | `10000` | channel capacity |
+| `BatchSize` | `50` | entries per batch |
+| `FlushInterval` | `3s` | periodic flush interval |
+| `MaxRetry` | `3` | write retries, `0` disables |
+| `WriteTimeout` | `5s` | per-write timeout |
+| `CloseTimeout` | `10s` | close drain timeout |
 
 ## License
 
