@@ -12,10 +12,10 @@
 // # Scope — Group Logs by Business Context
 //
 // Use WithScope to add a [scope] prefix so logs from different modules or
-// concurrent tasks are distinguishable.  Scope depth is capped at 3 levels.
+// concurrent tasks are distinguishable.  Scope depth should be kept to 2–3 levels.
 //
 //	deployLogger := ul.WithScope("service-deploy/order-service")
-//	envLogger := deployLogger.WithScope("env-setup")  // 3rd level — the limit
+//	envLogger := deployLogger.WithScope("env-setup")  // 3rd level — keep it shallow
 //
 // Name scopes with business semantics (action/object), not internal code paths:
 //
@@ -102,30 +102,23 @@ func NewContext(ctx context.Context, ul UserLogger) context.Context {
 	return context.WithValue(ctx, contextKey, ul)
 }
 
-// NewScopedLogger is a convenience alias for scoped.New.
-// Import the scoped sub-package directly for full functionality.
-func NewScopedLogger(base UserLogger, scopeSegments ...string) UserLogger {
-	return newScoped(base, scopeSegments...)
-}
+// --- no-op implementations ---
 
-// NewSpan is a convenience alias for creating a basic timed span.
-func NewSpan(logger UserLogger, name string) Span {
+func newSpan(logger UserLogger, name string) Span {
 	return &spanImpl{logger: logger, name: name, start: time.Now()}
 }
 
-// --- no-op implementations ---
-
 type noopUserLogger struct{}
 
-func (n *noopUserLogger) Log(string)                                     {}
-func (n *noopUserLogger) Logf(string, ...interface{})                    {}
-func (n *noopUserLogger) Info(string)                                    {}
-func (n *noopUserLogger) Infof(string, ...interface{})                   {}
-func (n *noopUserLogger) Error(string)                                   {}
-func (n *noopUserLogger) Errorf(f string, a ...interface{}) error        { return fmt.Errorf(f, a...) }
-func (n *noopUserLogger) Flush() error                                   { return nil }
-func (n *noopUserLogger) WithScope(string) UserLogger                    { return n }
-func (n *noopUserLogger) StartSpan(string) Span                          { return &noopSpan{} }
+func (n *noopUserLogger) Log(string)                              {}
+func (n *noopUserLogger) Logf(string, ...interface{})             {}
+func (n *noopUserLogger) Info(string)                             {}
+func (n *noopUserLogger) Infof(string, ...interface{})            {}
+func (n *noopUserLogger) Error(string)                            {}
+func (n *noopUserLogger) Errorf(f string, a ...interface{}) error { return fmt.Errorf(f, a...) }
+func (n *noopUserLogger) Flush() error                            { return nil }
+func (n *noopUserLogger) WithScope(string) UserLogger             { return n }
+func (n *noopUserLogger) StartSpan(string) Span                   { return &noopSpan{} }
 
 type noopSpan struct{}
 
@@ -139,70 +132,31 @@ type klogUserLogger struct {
 	klogger klog.Logger
 }
 
-func (k *klogUserLogger) Log(m string)                    { k.klogger.Info(m); k.base.Log(m) }
-func (k *klogUserLogger) Logf(f string, a ...interface{})  { k.klogger.Info(fmt.Sprintf(f, a...)); k.base.Logf(f, a...) }
-func (k *klogUserLogger) Info(m string)                   { k.klogger.Info(m); k.base.Info(m) }
-func (k *klogUserLogger) Infof(f string, a ...interface{}) { k.klogger.Info(fmt.Sprintf(f, a...)); k.base.Infof(f, a...) }
-func (k *klogUserLogger) Error(m string)                  { k.klogger.Error(nil, m); k.base.Error(m) }
+func (k *klogUserLogger) Log(m string) { k.klogger.Info(m); k.base.Log(m) }
+func (k *klogUserLogger) Logf(f string, a ...interface{}) {
+	k.klogger.Info(fmt.Sprintf(f, a...))
+	k.base.Logf(f, a...)
+}
+func (k *klogUserLogger) Info(m string) { k.klogger.Info(m); k.base.Info(m) }
+func (k *klogUserLogger) Infof(f string, a ...interface{}) {
+	k.klogger.Info(fmt.Sprintf(f, a...))
+	k.base.Infof(f, a...)
+}
+func (k *klogUserLogger) Error(m string) { k.klogger.Error(nil, m); k.base.Error(m) }
 func (k *klogUserLogger) Errorf(f string, a ...interface{}) error {
 	err := fmt.Errorf(f, a...)
 	k.klogger.Error(nil, err.Error())
 	return k.base.Errorf(f, a...)
 }
-func (k *klogUserLogger) Flush() error              { return k.base.Flush() }
-func (k *klogUserLogger) WithScope(s string) UserLogger { return &klogScoped{base: k, scopes: []string{s}} }
-func (k *klogUserLogger) StartSpan(n string) Span    { return NewSpan(k, n) }
+func (k *klogUserLogger) Flush() error { return k.base.Flush() }
+func (k *klogUserLogger) WithScope(s string) UserLogger {
+	return &klogScoped{base: k, scopes: []string{s}}
+}
+func (k *klogUserLogger) StartSpan(n string) Span { return newSpan(k, n) }
 
 var _ UserLogger = (*klogUserLogger)(nil)
 
-// --- minimal scoped / span for root package self-containment ---
-
-type scopedImpl struct {
-	base  UserLogger
-	scope []string
-}
-
-func newScoped(base UserLogger, segs ...string) *scopedImpl {
-	s := make([]string, len(segs))
-	copy(s, segs)
-	return &scopedImpl{base: base, scope: s}
-}
-
-func (l *scopedImpl) Log(m string)                      { l.base.Log(l.pfx(m)) }
-func (l *scopedImpl) Logf(f string, a ...interface{})    { l.base.Logf(l.pfx(f), a...) }
-func (l *scopedImpl) Info(m string)                     { l.base.Info(l.pfx(m)) }
-func (l *scopedImpl) Infof(f string, a ...interface{})   { l.base.Infof(l.pfx(f), a...) }
-func (l *scopedImpl) Error(m string)                    { l.base.Error(l.pfx(m)) }
-func (l *scopedImpl) Errorf(f string, a ...interface{}) error {
-	if p := l.scopeStr(); p != "" {
-		return l.base.Errorf("%s %w", p, fmt.Errorf(f, a...))
-	}
-	return l.base.Errorf(f, a...)
-}
-func (l *scopedImpl) Flush() error                      { return l.base.Flush() }
-func (l *scopedImpl) WithScope(s string) UserLogger {
-	ns := make([]string, len(l.scope)+1)
-	copy(ns, l.scope)
-	ns[len(l.scope)] = s
-	return &scopedImpl{base: l.base, scope: ns}
-}
-func (l *scopedImpl) StartSpan(n string) Span { return NewSpan(l, n) }
-
-func (l *scopedImpl) pfx(m string) string {
-	if p := l.scopeStr(); p != "" {
-		return p + " " + m
-	}
-	return m
-}
-
-func (l *scopedImpl) scopeStr() string {
-	if len(l.scope) == 0 {
-		return ""
-	}
-	return "[" + strings.Join(l.scope, "/") + "]"
-}
-
-var _ UserLogger = (*scopedImpl)(nil)
+// --- span for root package (avoids circular import) ---
 
 type spanImpl struct {
 	logger UserLogger
@@ -237,11 +191,11 @@ type klogScoped struct {
 	scopes []string
 }
 
-func (s *klogScoped) Log(m string)                    { s.base.Log(s.pfx(m)) }
+func (s *klogScoped) Log(m string)                     { s.base.Log(s.pfx(m)) }
 func (s *klogScoped) Logf(f string, a ...interface{})  { s.base.Log(s.pfx(fmt.Sprintf(f, a...))) }
-func (s *klogScoped) Info(m string)                   { s.base.Info(s.pfx(m)) }
+func (s *klogScoped) Info(m string)                    { s.base.Info(s.pfx(m)) }
 func (s *klogScoped) Infof(f string, a ...interface{}) { s.base.Info(s.pfx(fmt.Sprintf(f, a...))) }
-func (s *klogScoped) Error(m string)                  { s.base.Error(s.pfx(m)) }
+func (s *klogScoped) Error(m string)                   { s.base.Error(s.pfx(m)) }
 func (s *klogScoped) Errorf(f string, a ...interface{}) error {
 	p := s.scope()
 	if p == "" {
@@ -249,14 +203,14 @@ func (s *klogScoped) Errorf(f string, a ...interface{}) error {
 	}
 	return s.base.Errorf("%s %w", p, fmt.Errorf(f, a...))
 }
-func (s *klogScoped) Flush() error                { return s.base.Flush() }
+func (s *klogScoped) Flush() error { return s.base.Flush() }
 func (s *klogScoped) WithScope(scope string) UserLogger {
 	ns := make([]string, len(s.scopes)+1)
 	copy(ns, s.scopes)
 	ns[len(s.scopes)] = scope
 	return &klogScoped{base: s.base, scopes: ns}
 }
-func (s *klogScoped) StartSpan(n string) Span { return NewSpan(s, n) }
+func (s *klogScoped) StartSpan(n string) Span { return newSpan(s, n) }
 
 func (s *klogScoped) pfx(m string) string {
 	if p := s.scope(); p != "" {
@@ -269,14 +223,7 @@ func (s *klogScoped) scope() string {
 	if len(s.scopes) == 0 {
 		return ""
 	}
-	p := "["
-	for i, sc := range s.scopes {
-		if i > 0 {
-			p += "/"
-		}
-		p += sc
-	}
-	return p + "]"
+	return "[" + strings.Join(s.scopes, "/") + "]"
 }
 
 var _ UserLogger = (*klogScoped)(nil)

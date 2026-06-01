@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/gaozebin3/userlogger"
+	"github.com/gaozebin3/userlogger/span"
 )
 
 // ScopedUserLogger prepends [scope1/scope2/...] to every message.
@@ -35,12 +36,16 @@ func New(base userlogger.UserLogger, scope ...string) *ScopedUserLogger {
 	return &ScopedUserLogger{base: base, scope: s}
 }
 
-func (l *ScopedUserLogger) Log(message string)                       { l.base.Log(l.prefix(message)) }
-func (l *ScopedUserLogger) Logf(format string, args ...interface{})   { l.base.Logf(l.prefixFmt(format), args...) }
-func (l *ScopedUserLogger) Info(message string)                      { l.base.Info(l.prefix(message)) }
-func (l *ScopedUserLogger) Infof(format string, args ...interface{})  { l.base.Infof(l.prefixFmt(format), args...) }
-func (l *ScopedUserLogger) Error(message string)                     { l.base.Error(l.prefix(message)) }
-func (l *ScopedUserLogger) Flush() error                             { return l.base.Flush() }
+func (l *ScopedUserLogger) Log(message string) { l.base.Log(l.prefix(message)) }
+func (l *ScopedUserLogger) Logf(format string, args ...interface{}) {
+	l.base.Logf(l.prefixFmt(format), args...)
+}
+func (l *ScopedUserLogger) Info(message string) { l.base.Info(l.prefix(message)) }
+func (l *ScopedUserLogger) Infof(format string, args ...interface{}) {
+	l.base.Infof(l.prefixFmt(format), args...)
+}
+func (l *ScopedUserLogger) Error(message string) { l.base.Error(l.prefix(message)) }
+func (l *ScopedUserLogger) Flush() error         { return l.base.Flush() }
 
 // Errorf prepends the scope and wraps the formatted error via %w so that
 // errors.Is/As continue to work.
@@ -62,7 +67,7 @@ func (l *ScopedUserLogger) WithScope(scope string) userlogger.UserLogger {
 
 // StartSpan creates a timed span via the span sub-package.
 func (l *ScopedUserLogger) StartSpan(name string) userlogger.Span {
-	return userlogger.NewSpan(l, name)
+	return span.New(l, name)
 }
 
 func (l *ScopedUserLogger) prefix(msg string) string {

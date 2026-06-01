@@ -10,6 +10,7 @@ import (
 
 	"github.com/gaozebin3/userlogger"
 	"github.com/gaozebin3/userlogger/scoped"
+	"github.com/gaozebin3/userlogger/span"
 )
 
 type mock struct {
@@ -17,11 +18,11 @@ type mock struct {
 	logs []string
 }
 
-func (m *mock) Log(s string)                       { m.mu.Lock(); m.logs = append(m.logs, s); m.mu.Unlock() }
-func (m *mock) Logf(f string, a ...interface{})    { m.Log(fmt.Sprintf(f, a...)) }
-func (m *mock) Info(s string)                      { m.mu.Lock(); m.logs = append(m.logs, "[INFO] "+s); m.mu.Unlock() }
-func (m *mock) Infof(f string, a ...interface{})    { m.Info(fmt.Sprintf(f, a...)) }
-func (m *mock) Error(s string)                     { m.mu.Lock(); m.logs = append(m.logs, "[ERROR] "+s); m.mu.Unlock() }
+func (m *mock) Log(s string)                     { m.mu.Lock(); m.logs = append(m.logs, s); m.mu.Unlock() }
+func (m *mock) Logf(f string, a ...interface{})  { m.Log(fmt.Sprintf(f, a...)) }
+func (m *mock) Info(s string)                    { m.mu.Lock(); m.logs = append(m.logs, "[INFO] "+s); m.mu.Unlock() }
+func (m *mock) Infof(f string, a ...interface{}) { m.Info(fmt.Sprintf(f, a...)) }
+func (m *mock) Error(s string)                   { m.mu.Lock(); m.logs = append(m.logs, "[ERROR] "+s); m.mu.Unlock() }
 func (m *mock) Errorf(f string, a ...interface{}) error {
 	m.mu.Lock()
 	e := fmt.Errorf(f, a...)
@@ -29,10 +30,10 @@ func (m *mock) Errorf(f string, a ...interface{}) error {
 	m.mu.Unlock()
 	return e
 }
-func (m *mock) Flush() error                     { return nil }
+func (m *mock) Flush() error                             { return nil }
 func (m *mock) WithScope(s string) userlogger.UserLogger { return scoped.New(m, s) }
-func (m *mock) StartSpan(n string) userlogger.Span       { return userlogger.NewSpan(m, n) }
-func (m *mock) get() []string { m.mu.Lock(); defer m.mu.Unlock(); return append([]string{}, m.logs...) }
+func (m *mock) StartSpan(n string) userlogger.Span       { return span.New(m, n) }
+func (m *mock) get() []string                            { m.mu.Lock(); defer m.mu.Unlock(); return append([]string{}, m.logs...) }
 
 func TestScopePrefix(t *testing.T) {
 	m := &mock{}
@@ -84,11 +85,19 @@ func TestImmutability(t *testing.T) {
 	l1 := scoped.New(m, "a")
 	l2 := l1.WithScope("b")
 	l3 := l2.WithScope("c")
-	l1.Info("1"); l2.Info("2"); l3.Info("3")
+	l1.Info("1")
+	l2.Info("2")
+	l3.Info("3")
 	logs := m.get()
-	if !strings.Contains(logs[0], "[a] 1") { t.Errorf("l1: %q", logs[0]) }
-	if !strings.Contains(logs[1], "[a/b] 2") { t.Errorf("l2: %q", logs[1]) }
-	if !strings.Contains(logs[2], "[a/b/c] 3") { t.Errorf("l3: %q", logs[2]) }
+	if !strings.Contains(logs[0], "[a] 1") {
+		t.Errorf("l1: %q", logs[0])
+	}
+	if !strings.Contains(logs[1], "[a/b] 2") {
+		t.Errorf("l2: %q", logs[1])
+	}
+	if !strings.Contains(logs[2], "[a/b/c] 3") {
+		t.Errorf("l3: %q", logs[2])
+	}
 }
 
 func TestSpanDuration(t *testing.T) {
@@ -112,7 +121,12 @@ func TestSpanError(t *testing.T) {
 func TestAllMethods(t *testing.T) {
 	m := &mock{}
 	l := scoped.New(m, "t")
-	l.Log("a"); l.Logf("b %d", 1); l.Info("c"); l.Infof("d %d", 2); l.Error("e"); l.Errorf("f: %v", fmt.Errorf("x"))
+	l.Log("a")
+	l.Logf("b %d", 1)
+	l.Info("c")
+	l.Infof("d %d", 2)
+	l.Error("e")
+	l.Errorf("f: %v", fmt.Errorf("x"))
 	if len(m.get()) != 6 {
 		t.Errorf("expected 6, got %d", len(m.get()))
 	}

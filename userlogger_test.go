@@ -16,12 +16,12 @@ type testSink struct {
 	errors []string
 }
 
-func (s *testSink) Init(info logr.RuntimeInfo)                       {}
-func (s *testSink) Enabled(level int) bool                           { return true }
-func (s *testSink) Info(level int, msg string, kv ...interface{})    { s.infos = append(s.infos, msg) }
-func (s *testSink) Error(err error, msg string, kv ...interface{})   { s.errors = append(s.errors, msg) }
-func (s *testSink) WithValues(kv ...interface{}) logr.LogSink        { return s }
-func (s *testSink) WithName(name string) logr.LogSink                { return s }
+func (s *testSink) Init(info logr.RuntimeInfo)                     {}
+func (s *testSink) Enabled(level int) bool                         { return true }
+func (s *testSink) Info(level int, msg string, kv ...interface{})  { s.infos = append(s.infos, msg) }
+func (s *testSink) Error(err error, msg string, kv ...interface{}) { s.errors = append(s.errors, msg) }
+func (s *testSink) WithValues(kv ...interface{}) logr.LogSink      { return s }
+func (s *testSink) WithName(name string) logr.LogSink              { return s }
 
 func klogCtx(t *testing.T) (context.Context, *testSink) {
 	t.Helper()
@@ -35,19 +35,19 @@ type capture struct {
 	logs   []string
 }
 
-func (c *capture) Log(m string)                      { c.logs = append(c.logs, m) }
-func (c *capture) Logf(f string, a ...interface{})   { c.logs = append(c.logs, fmt.Sprintf(f, a...)) }
-func (c *capture) Info(m string)                     { c.infos = append(c.infos, m) }
-func (c *capture) Infof(f string, a ...interface{})   { c.infos = append(c.infos, fmt.Sprintf(f, a...)) }
-func (c *capture) Error(m string)                    { c.errors = append(c.errors, m) }
+func (c *capture) Log(m string)                     { c.logs = append(c.logs, m) }
+func (c *capture) Logf(f string, a ...interface{})  { c.logs = append(c.logs, fmt.Sprintf(f, a...)) }
+func (c *capture) Info(m string)                    { c.infos = append(c.infos, m) }
+func (c *capture) Infof(f string, a ...interface{}) { c.infos = append(c.infos, fmt.Sprintf(f, a...)) }
+func (c *capture) Error(m string)                   { c.errors = append(c.errors, m) }
 func (c *capture) Errorf(f string, a ...interface{}) error {
 	err := fmt.Errorf(f, a...)
 	c.errors = append(c.errors, err.Error())
 	return err
 }
-func (c *capture) Flush() error                      { return nil }
-func (c *capture) WithScope(string) UserLogger       { return c }
-func (c *capture) StartSpan(string) Span             { return &noopSpan{} }
+func (c *capture) Flush() error                { return nil }
+func (c *capture) WithScope(string) UserLogger { return c }
+func (c *capture) StartSpan(string) Span       { return &noopSpan{} }
 
 func TestFromContext_NoKlog(t *testing.T) {
 	base := &capture{}
@@ -182,23 +182,5 @@ func TestKlogScoped_Logf(t *testing.T) {
 	FromContext(ctx).WithScope("deploy").Logf("progress %d%%", 50)
 	if sink.infos[0] != "[deploy] progress 50%" || base.logs[0] != "[deploy] progress 50%" {
 		t.Fatalf("scoped logf mismatch, sink=%q base=%q", sink.infos[0], base.logs[0])
-	}
-}
-
-func TestNewSpanConvenience(t *testing.T) {
-	base := &capture{}
-	s := NewSpan(base, "test op")
-	s.Done()
-	if !strings.Contains(base.infos[0], "✓ test op done") {
-		t.Fatalf("NewSpan convenience should work, got %q", base.infos[0])
-	}
-}
-
-func TestNewScopedLoggerConvenience(t *testing.T) {
-	base := &capture{}
-	l := NewScopedLogger(base, "test")
-	l.Info("hello")
-	if !strings.Contains(base.infos[0], "[test] hello") {
-		t.Fatalf("NewScopedLogger convenience should work, got %q", base.infos[0])
 	}
 }

@@ -38,13 +38,15 @@ type LogWriter interface {
 }
 
 // Options configures an AsyncLogger.
+// Zero-valued fields use defaults, except MaxRetry where 0 means "no retry"
+// (use -1 or omit the field to get the default of 3).
 type Options struct {
-	ChannelBufferCount int           // channel capacity in entries (default 10000)
-	BatchSize          int           // entries per flush (default 50)
-	FlushInterval      time.Duration // periodic flush interval (default 3s)
-	MaxRetry           int           // write retries (default 3)
-	WriteTimeout       time.Duration // per WriteLog timeout (default 5s)
-	CloseTimeout       time.Duration // Close drain timeout (default 10s)
+	ChannelBufferCount int
+	BatchSize          int
+	FlushInterval      time.Duration
+	MaxRetry           int
+	WriteTimeout       time.Duration
+	CloseTimeout       time.Duration
 }
 
 // DefaultOptions returns sensible defaults.
@@ -59,6 +61,32 @@ func DefaultOptions() *Options {
 	}
 }
 
+func normalizeOptions(opts *Options) *Options {
+	if opts == nil {
+		return DefaultOptions()
+	}
+	o := *opts
+	if o.ChannelBufferCount <= 0 {
+		o.ChannelBufferCount = 10000
+	}
+	if o.BatchSize <= 0 {
+		o.BatchSize = 50
+	}
+	if o.FlushInterval <= 0 {
+		o.FlushInterval = 3 * time.Second
+	}
+	if o.MaxRetry < 0 {
+		o.MaxRetry = 3
+	}
+	if o.WriteTimeout <= 0 {
+		o.WriteTimeout = 5 * time.Second
+	}
+	if o.CloseTimeout <= 0 {
+		o.CloseTimeout = 10 * time.Second
+	}
+	return &o
+}
+
 // AsyncLogger is a channel-based, non-blocking UserLogger.
 // Architecture: fixed-capacity channel → single consumer goroutine → batched
 // writes with retry.  When the channel is full, entries are silently dropped
@@ -66,12 +94,15 @@ func DefaultOptions() *Options {
 type AsyncLogger struct {
 	writer        LogWriter
 	logCh         chan string
+	flushCh       chan chan error
 	ctx           context.Context
 	cancel        context.CancelFunc
 	consumerWg    sync.WaitGroup
-	closed        bool
 	closedMu      sync.Mutex
+	closed        bool
 	closeOnce     sync.Once
+	closeErr      error
+	consumerErr   error
 	batchSize     int
 	flushInterval time.Duration
 	maxRetry      int
@@ -81,18 +112,21 @@ type AsyncLogger struct {
 }
 
 // New creates an AsyncLogger and starts its consumer goroutine.
+// Nil opts uses defaults; zero-valued fields are normalized.
 func New(writer LogWriter, opts *Options) *AsyncLogger {
+	o := normalizeOptions(opts)
 	ctx, cancel := context.WithCancel(context.Background())
 	l := &AsyncLogger{
 		writer:        writer,
-		logCh:         make(chan string, opts.ChannelBufferCount),
+		logCh:         make(chan string, o.ChannelBufferCount),
+		flushCh:       make(chan chan error),
 		ctx:           ctx,
 		cancel:        cancel,
-		batchSize:     opts.BatchSize,
-		flushInterval: opts.FlushInterval,
-		maxRetry:      opts.MaxRetry,
-		writeTimeout:  opts.WriteTimeout,
-		closeTimeout:  opts.CloseTimeout,
+		batchSize:     o.BatchSize,
+		flushInterval: o.FlushInterval,
+		maxRetry:      o.MaxRetry,
+		writeTimeout:  o.WriteTimeout,
+		closeTimeout:  o.CloseTimeout,
 	}
 	l.consumerWg.Add(1)
 	go l.consumerLoop()
@@ -101,22 +135,23 @@ func New(writer LogWriter, opts *Options) *AsyncLogger {
 
 func (l *AsyncLogger) sendLog(message string) {
 	l.closedMu.Lock()
-	closed := l.closed
-	l.closedMu.Unlock()
-	if closed {
+	if l.closed {
+		l.closedMu.Unlock()
 		return
 	}
 	select {
 	case l.logCh <- message + "\n":
+		l.closedMu.Unlock()
 	default:
+		l.closedMu.Unlock()
 		atomic.AddInt64(&l.droppedCount, 1)
 	}
 }
 
-func (l *AsyncLogger) Log(message string)                      { l.sendLog(message) }
-func (l *AsyncLogger) Logf(f string, a ...interface{})         { l.Log(fmt.Sprintf(f, a...)) }
-func (l *AsyncLogger) Info(message string)                     { l.Infof("%s", message) }
-func (l *AsyncLogger) Error(message string)                    { l.Errorf("%s", message) }
+func (l *AsyncLogger) Log(message string)              { l.sendLog(message) }
+func (l *AsyncLogger) Logf(f string, a ...interface{}) { l.Log(fmt.Sprintf(f, a...)) }
+func (l *AsyncLogger) Info(message string)             { l.Infof("%s", message) }
+func (l *AsyncLogger) Error(message string)            { l.Errorf("%s", message) }
 
 func (l *AsyncLogger) Infof(f string, a ...interface{}) {
 	ts := time.Now().Format("2006-01-02 15:04:05")
@@ -151,35 +186,63 @@ func (l *AsyncLogger) consumerLoop() {
 				l.flushBatch(batch)
 				batch = batch[:0]
 			}
+		case ack := <-l.flushCh:
+			batch = l.drainAndFlush(batch, ack)
 		case <-ticker.C:
 			if len(batch) > 0 {
 				l.flushBatch(batch)
 				batch = batch[:0]
 			}
 		case <-l.ctx.Done():
+			var lastErr error
 			for {
 				select {
 				case e := <-l.logCh:
 					batch = append(batch, e)
 					if len(batch) >= l.batchSize {
-						l.flushBatch(batch)
+						if err := l.flushBatch(batch); err != nil {
+							lastErr = err
+						}
 						batch = batch[:0]
 					}
 				default:
-					goto DRAINED
+					if err := l.flushBatch(batch); err != nil {
+						lastErr = err
+					}
+					l.consumerErr = lastErr
+					return
 				}
 			}
-		DRAINED:
-			l.flushBatch(batch)
-			return
 		}
 	}
 }
 
-func (l *AsyncLogger) flushBatch(batch []string) {
-	dropped := atomic.SwapInt64(&l.droppedCount, 0)
+func (l *AsyncLogger) drainAndFlush(batch []string, ack chan<- error) []string {
+	var lastErr error
+	for {
+		select {
+		case e := <-l.logCh:
+			batch = append(batch, e)
+			if len(batch) >= l.batchSize {
+				if err := l.flushBatch(batch); err != nil {
+					lastErr = err
+				}
+				batch = batch[:0]
+			}
+		default:
+			if err := l.flushBatch(batch); err != nil {
+				lastErr = err
+			}
+			ack <- lastErr
+			return batch[:0]
+		}
+	}
+}
+
+func (l *AsyncLogger) flushBatch(batch []string) error {
+	dropped := atomic.LoadInt64(&l.droppedCount)
 	if len(batch) == 0 && dropped == 0 {
-		return
+		return nil
 	}
 	if dropped > 0 {
 		batch = append([]string{fmt.Sprintf("[System Warning] Buffer overflow: skipped %d logs due to slow writer.\n", dropped)}, batch...)
@@ -192,10 +255,14 @@ func (l *AsyncLogger) flushBatch(batch []string) {
 		}
 		err = l.writeContent(content)
 		if err == nil {
-			return
+			if dropped > 0 {
+				atomic.AddInt64(&l.droppedCount, -dropped)
+			}
+			return nil
 		}
 	}
 	klog.Errorf("AsyncLogger flush failed after %d retries: %v", l.maxRetry, err)
+	return err
 }
 
 func (l *AsyncLogger) writeContent(content string) error {
@@ -204,35 +271,29 @@ func (l *AsyncLogger) writeContent(content string) error {
 	return l.writer.WriteLog(ctx, content)
 }
 
-// Flush waits for the internal channel to drain (best-effort, 10s timeout).
+// Flush drains pending entries and waits for them to be persisted.
+// Returns persistence errors from this explicit flush request.
 func (l *AsyncLogger) Flush() error {
-	timeout := time.After(10 * time.Second)
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	empty := 0
-	for {
-		select {
-		case <-ticker.C:
-			if len(l.logCh) == 0 {
-				empty++
-				if empty >= 4 {
-					return nil
-				}
-			} else {
-				empty = 0
-			}
-		case <-timeout:
-			return fmt.Errorf("flush timeout")
-		case <-l.ctx.Done():
-			return fmt.Errorf("logger closed")
-		}
+	ack := make(chan error, 1)
+	select {
+	case l.flushCh <- ack:
+	case <-l.ctx.Done():
+		return fmt.Errorf("logger closed")
+	}
+	select {
+	case err := <-ack:
+		return err
+	case <-time.After(10 * time.Second):
+		return fmt.Errorf("flush timeout")
+	case <-l.ctx.Done():
+		return fmt.Errorf("logger closed")
 	}
 }
 
 // Close stops accepting new entries, drains the channel, and waits for the
-// consumer to exit.  Safe to call multiple times.
+// consumer to exit. Safe to call multiple times; returns the first error
+// from close timeout or the final drain.
 func (l *AsyncLogger) Close() error {
-	var firstErr error
 	l.closeOnce.Do(func() {
 		l.closedMu.Lock()
 		l.closed = true
@@ -243,13 +304,16 @@ func (l *AsyncLogger) Close() error {
 		select {
 		case <-done:
 		case <-time.After(l.closeTimeout):
-			firstErr = fmt.Errorf("close timeout: consumer goroutine did not exit in time")
+			l.closeErr = fmt.Errorf("close timeout: consumer goroutine did not exit in time")
+		}
+		if l.closeErr == nil {
+			l.closeErr = l.consumerErr
 		}
 		if d := atomic.LoadInt64(&l.droppedCount); d > 0 {
 			klog.Warningf("AsyncLogger closed with %d logs dropped", d)
 		}
 	})
-	return firstErr
+	return l.closeErr
 }
 
 var _ userlogger.UserLogger = (*AsyncLogger)(nil)

@@ -37,9 +37,9 @@ func (m *mockWriter) WriteLog(ctx context.Context, c string) error {
 	return nil
 }
 
-func (m *mockWriter) get() string   { m.mu.Lock(); defer m.mu.Unlock(); return m.content }
-func (m *mockWriter) cnt() int32    { return atomic.LoadInt32(&m.count) }
-func has(s, sub string) bool        { return strings.Contains(s, sub) }
+func (m *mockWriter) get() string { m.mu.Lock(); defer m.mu.Unlock(); return m.content }
+func (m *mockWriter) cnt() int32  { return atomic.LoadInt32(&m.count) }
+func has(s, sub string) bool      { return strings.Contains(s, sub) }
 
 func opts() *async.Options { return async.DefaultOptions() }
 
@@ -230,5 +230,161 @@ func TestCloseNoPanic(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Error("goroutine hung")
+	}
+}
+
+func TestNewNilOptions(t *testing.T) {
+	w := &mockWriter{}
+	l := async.New(w, nil)
+	l.Info("nil opts test")
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if w.get() == "" {
+		t.Error("expected log output with nil opts")
+	}
+}
+
+func TestNewZeroOptions(t *testing.T) {
+	w := &mockWriter{}
+	l := async.New(w, &async.Options{})
+	l.Info("zero opts test")
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if w.get() == "" {
+		t.Error("expected log output with zero opts")
+	}
+}
+
+func TestFlushGuarantee(t *testing.T) {
+	w := &mockWriter{delay: 20 * time.Millisecond}
+	o := opts()
+	o.FlushInterval = 10 * time.Minute
+	l := async.New(w, o)
+	for i := 0; i < 5; i++ {
+		l.Infof("msg %d", i)
+	}
+	if err := l.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	c := w.get()
+	for i := 0; i < 5; i++ {
+		if !has(c, fmt.Sprintf("msg %d", i)) {
+			t.Errorf("msg %d missing after Flush", i)
+		}
+	}
+	l.Close()
+}
+
+func TestFlushAfterClose(t *testing.T) {
+	w := &mockWriter{}
+	l := async.New(w, opts())
+	l.Close()
+	if err := l.Flush(); err == nil {
+		t.Error("expected error flushing after close")
+	}
+}
+
+func TestCloseIdempotent(t *testing.T) {
+	w := &mockWriter{}
+	l := async.New(w, opts())
+	err1 := l.Close()
+	err2 := l.Close()
+	err3 := l.Close()
+	if err1 != nil || err2 != nil || err3 != nil {
+		t.Errorf("all Close calls should succeed: %v %v %v", err1, err2, err3)
+	}
+}
+
+func TestMaxRetryZero(t *testing.T) {
+	w := &mockWriter{failUntil: 1}
+	o := opts()
+	o.MaxRetry = 0
+	o.FlushInterval = 10 * time.Minute
+	l := async.New(w, o)
+	l.Info("no-retry test")
+	if err := l.Flush(); err == nil {
+		t.Error("Flush should return error when writer fails with MaxRetry=0")
+	}
+	l.Close()
+}
+
+func TestCloseReportsFlushFailure(t *testing.T) {
+	w := &mockWriter{failUntil: 10}
+	o := opts()
+	o.MaxRetry = 0
+	o.FlushInterval = 10 * time.Minute
+	l := async.New(w, o)
+	l.Info("will-fail")
+	if err := l.Close(); err == nil {
+		t.Error("Close should return error when final drain persistence fails")
+	}
+}
+
+func TestFlushDoesNotReportRecoveredBackgroundFailure(t *testing.T) {
+	w := &mockWriter{failUntil: 10}
+	o := opts()
+	o.BatchSize = 1
+	o.MaxRetry = 0
+	o.FlushInterval = 10 * time.Minute
+	l := async.New(w, o)
+	l.Info("trigger-batch-fail")
+	deadline := time.After(2 * time.Second)
+	for atomic.LoadInt32(&w.failUntil) == 10 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for background flush failure")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	atomic.StoreInt32(&w.failUntil, 0)
+	l.Info("ok-after-fail")
+	deadline = time.After(2 * time.Second)
+	for !has(w.get(), "ok-after-fail") {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for later background flush success")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := l.Flush(); err != nil {
+		t.Fatalf("Flush should not report recovered background flush error: %v", err)
+	}
+	l.Close()
+}
+
+func TestCloseDoesNotReportRecoveredBackgroundFailure(t *testing.T) {
+	w := &mockWriter{failUntil: 10}
+	o := opts()
+	o.BatchSize = 1
+	o.MaxRetry = 0
+	o.FlushInterval = 10 * time.Minute
+	l := async.New(w, o)
+	l.Info("trigger-batch-fail")
+	deadline := time.After(2 * time.Second)
+	for atomic.LoadInt32(&w.failUntil) == 10 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for background flush failure")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	atomic.StoreInt32(&w.failUntil, 0)
+	l.Info("ok-before-close")
+	deadline = time.After(2 * time.Second)
+	for !has(w.get(), "ok-before-close") {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for later background flush success")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close should not report recovered background flush error: %v", err)
 	}
 }

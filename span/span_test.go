@@ -12,19 +12,19 @@ import (
 
 type mock struct{ logs []string }
 
-func (m *mock) Log(s string)                       { m.logs = append(m.logs, s) }
-func (m *mock) Logf(f string, a ...interface{})    { m.logs = append(m.logs, fmt.Sprintf(f, a...)) }
-func (m *mock) Info(s string)                      { m.logs = append(m.logs, "[INFO] "+s) }
-func (m *mock) Infof(f string, a ...interface{})    { m.Info(fmt.Sprintf(f, a...)) }
-func (m *mock) Error(s string)                     { m.logs = append(m.logs, "[ERROR] "+s) }
+func (m *mock) Log(s string)                     { m.logs = append(m.logs, s) }
+func (m *mock) Logf(f string, a ...interface{})  { m.logs = append(m.logs, fmt.Sprintf(f, a...)) }
+func (m *mock) Info(s string)                    { m.logs = append(m.logs, "[INFO] "+s) }
+func (m *mock) Infof(f string, a ...interface{}) { m.Info(fmt.Sprintf(f, a...)) }
+func (m *mock) Error(s string)                   { m.logs = append(m.logs, "[ERROR] "+s) }
 func (m *mock) Errorf(f string, a ...interface{}) error {
 	e := fmt.Errorf(f, a...)
 	m.logs = append(m.logs, "[ERROR] "+e.Error())
 	return e
 }
-func (m *mock) Flush() error                            { return nil }
-func (m *mock) WithScope(string) userlogger.UserLogger  { return m }
-func (m *mock) StartSpan(string) userlogger.Span        { return span.New(m, "x") }
+func (m *mock) Flush() error                           { return nil }
+func (m *mock) WithScope(string) userlogger.UserLogger { return m }
+func (m *mock) StartSpan(string) userlogger.Span       { return span.New(m, "x") }
 
 func TestSpan_Done(t *testing.T) {
 	m := &mock{}
