@@ -1,0 +1,8 @@
+module github.com/gaozebin3/userlogger
+
+go 1.24.0
+
+require (
+	github.com/go-logr/logr v1.4.2
+	k8s.io/klog/v2 v2.130.1
+)
