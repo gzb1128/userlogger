@@ -118,6 +118,27 @@ func TestSpanError(t *testing.T) {
 	}
 }
 
+func TestLogfPercentInScope(t *testing.T) {
+	m := &mock{}
+	// a '%' inside a scope segment must not be reinterpreted as a fmt verb
+	scoped.New(m, "load-100%").Logf("progress %d%%", 50)
+	got := m.get()[0]
+	want := "[load-100%] progress 50%"
+	if !strings.Contains(got, want) {
+		t.Errorf("scope '%%' corrupted output: got %q, want substring %q", got, want)
+	}
+}
+
+func TestInfofPercentInScope(t *testing.T) {
+	m := &mock{}
+	scoped.New(m, "cpu-50%").Infof("value %d", 7)
+	got := m.get()[0]
+	want := "[cpu-50%] value 7"
+	if !strings.Contains(got, want) {
+		t.Errorf("scope '%%' corrupted output: got %q, want substring %q", got, want)
+	}
+}
+
 func TestAllMethods(t *testing.T) {
 	m := &mock{}
 	l := scoped.New(m, "t")

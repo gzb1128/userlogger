@@ -38,8 +38,10 @@ type LogWriter interface {
 }
 
 // Options configures an AsyncLogger.
-// Zero-valued fields use defaults, except MaxRetry where 0 means "no retry"
-// (use -1 or omit the field to get the default of 3).
+// For every field except MaxRetry, a zero or negative value falls back to the
+// default shown below. MaxRetry is special: 0 means "no retry" (a failing
+// batch is reported once and dropped); pass a negative value (or use
+// DefaultOptions) to get the default of 3 retries.
 type Options struct {
 	ChannelBufferCount int
 	BatchSize          int
@@ -150,19 +152,27 @@ func (l *AsyncLogger) sendLog(message string) {
 
 func (l *AsyncLogger) Log(message string)              { l.sendLog(message) }
 func (l *AsyncLogger) Logf(f string, a ...interface{}) { l.Log(fmt.Sprintf(f, a...)) }
-func (l *AsyncLogger) Info(message string)             { l.Infof("%s", message) }
-func (l *AsyncLogger) Error(message string)            { l.Errorf("%s", message) }
+func (l *AsyncLogger) Info(message string) {
+	l.sendLog(timestampPrefix() + message)
+}
+func (l *AsyncLogger) Error(message string) {
+	l.sendLog(timestampPrefix() + "❌ " + message)
+}
 
 func (l *AsyncLogger) Infof(f string, a ...interface{}) {
-	ts := time.Now().Format("2006-01-02 15:04:05")
-	l.sendLog(fmt.Sprintf("[%s] %s", ts, fmt.Sprintf(f, a...)))
+	l.sendLog(timestampPrefix() + fmt.Sprintf(f, a...))
 }
 
 func (l *AsyncLogger) Errorf(f string, a ...interface{}) error {
 	err := fmt.Errorf(f, a...)
-	ts := time.Now().Format("2006-01-02 15:04:05")
-	l.sendLog(fmt.Sprintf("[%s] ❌ %s", ts, err.Error()))
+	l.sendLog(timestampPrefix() + "❌ " + err.Error())
 	return err
+}
+
+// timestampPrefix returns "[YYYY-MM-DD HH:MM:SS] " using a single concat
+// instead of two fmt.Sprintf calls.
+func timestampPrefix() string {
+	return "[" + time.Now().Format("2006-01-02 15:04:05") + "] "
 }
 
 func (l *AsyncLogger) WithScope(scope string) userlogger.UserLogger {
@@ -272,7 +282,10 @@ func (l *AsyncLogger) writeContent(content string) error {
 }
 
 // Flush drains pending entries and waits for them to be persisted.
-// Returns persistence errors from this explicit flush request.
+// It blocks until the consumer finishes the flush, the logger is closed, or
+// a 10s hard deadline elapses (independent of WriteTimeout/MaxRetry). The
+// returned error is the persistence error from the drained batch, or
+// "logger closed" / "flush timeout" for those termination cases.
 func (l *AsyncLogger) Flush() error {
 	ack := make(chan error, 1)
 	select {
@@ -291,8 +304,9 @@ func (l *AsyncLogger) Flush() error {
 }
 
 // Close stops accepting new entries, drains the channel, and waits for the
-// consumer to exit. Safe to call multiple times; returns the first error
-// from close timeout or the final drain.
+// consumer to exit. Safe to call multiple times. Returns the last persistence
+// error seen during the final drain, or a close-timeout error if the consumer
+// did not exit within CloseTimeout.
 func (l *AsyncLogger) Close() error {
 	l.closeOnce.Do(func() {
 		l.closedMu.Lock()
