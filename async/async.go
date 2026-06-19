@@ -150,29 +150,28 @@ func (l *AsyncLogger) sendLog(message string) {
 	}
 }
 
+// tsLayout is the timestamp format prefixed to structured (Info/Error) lines.
+// Inlining the concat at each call site (rather than via a helper) lets the
+// compiler fold the whole expression into a single runtime.concatstrings call.
+const tsLayout = "2006-01-02 15:04:05"
+
 func (l *AsyncLogger) Log(message string)              { l.sendLog(message) }
 func (l *AsyncLogger) Logf(f string, a ...interface{}) { l.Log(fmt.Sprintf(f, a...)) }
 func (l *AsyncLogger) Info(message string) {
-	l.sendLog(timestampPrefix() + message)
+	l.sendLog("[" + time.Now().Format(tsLayout) + "] " + message)
 }
 func (l *AsyncLogger) Error(message string) {
-	l.sendLog(timestampPrefix() + "❌ " + message)
+	l.sendLog("[" + time.Now().Format(tsLayout) + "] ❌ " + message)
 }
 
 func (l *AsyncLogger) Infof(f string, a ...interface{}) {
-	l.sendLog(timestampPrefix() + fmt.Sprintf(f, a...))
+	l.sendLog("[" + time.Now().Format(tsLayout) + "] " + fmt.Sprintf(f, a...))
 }
 
 func (l *AsyncLogger) Errorf(f string, a ...interface{}) error {
 	err := fmt.Errorf(f, a...)
-	l.sendLog(timestampPrefix() + "❌ " + err.Error())
+	l.sendLog("[" + time.Now().Format(tsLayout) + "] ❌ " + err.Error())
 	return err
-}
-
-// timestampPrefix returns "[YYYY-MM-DD HH:MM:SS] " using a single concat
-// instead of two fmt.Sprintf calls.
-func timestampPrefix() string {
-	return "[" + time.Now().Format("2006-01-02 15:04:05") + "] "
 }
 
 func (l *AsyncLogger) WithScope(scope string) userlogger.UserLogger {
@@ -282,10 +281,12 @@ func (l *AsyncLogger) writeContent(content string) error {
 }
 
 // Flush drains pending entries and waits for them to be persisted.
-// It blocks until the consumer finishes the flush, the logger is closed, or
-// a 10s hard deadline elapses (independent of WriteTimeout/MaxRetry). The
-// returned error is the persistence error from the drained batch, or
-// "logger closed" / "flush timeout" for those termination cases.
+//
+// Two phases: (1) wait for the consumer to accept the flush request — this has
+// no timeout, so it can block indefinitely if the consumer is stuck inside a
+// slow flushBatch; (2) wait up to 10s for the consumer to report the result
+// (the 10s is independent of WriteTimeout/MaxRetry). Returns the persistence
+// error from the drained batch, or "logger closed" / "flush timeout".
 func (l *AsyncLogger) Flush() error {
 	ack := make(chan error, 1)
 	select {
