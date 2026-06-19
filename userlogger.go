@@ -3,6 +3,8 @@
 //
 // # Quick Start
 //
+// Assuming ctx already carries a UserLogger (see Context below):
+//
 //	ul := userlogger.FromContext(ctx)
 //	ul.Info("starting deployment")        // structured, with timestamp
 //	ul.Logf("deployed %d instances", 10)   // formatted, no timestamp

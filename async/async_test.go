@@ -18,11 +18,13 @@ type mockWriter struct {
 	mu        sync.Mutex
 	content   string
 	count     int32
+	attempts  int32
 	delay     time.Duration
 	failUntil int32
 }
 
 func (m *mockWriter) WriteLog(ctx context.Context, c string) error {
+	atomic.AddInt32(&m.attempts, 1)
 	if m.delay > 0 {
 		time.Sleep(m.delay)
 	}
@@ -37,9 +39,10 @@ func (m *mockWriter) WriteLog(ctx context.Context, c string) error {
 	return nil
 }
 
-func (m *mockWriter) get() string { m.mu.Lock(); defer m.mu.Unlock(); return m.content }
-func (m *mockWriter) cnt() int32  { return atomic.LoadInt32(&m.count) }
-func has(s, sub string) bool      { return strings.Contains(s, sub) }
+func (m *mockWriter) get() string      { m.mu.Lock(); defer m.mu.Unlock(); return m.content }
+func (m *mockWriter) cnt() int32       { return atomic.LoadInt32(&m.count) }
+func (m *mockWriter) attemptsN() int32 { return atomic.LoadInt32(&m.attempts) }
+func has(s, sub string) bool           { return strings.Contains(s, sub) }
 
 func opts() *async.Options { return async.DefaultOptions() }
 
@@ -62,15 +65,43 @@ func TestErrorfWrap(t *testing.T) {
 }
 
 func TestNonBlocking(t *testing.T) {
-	w := &mockWriter{delay: 500 * time.Millisecond}
-	l := async.New(w, opts())
-	defer l.Close()
+	gate := make(chan struct{})
+	w := &gatedWriter{gate: gate}
+	o := opts()
+	o.ChannelBufferCount = 8
+	o.BatchSize = 2 // a couple of messages triggers a flush so the consumer stalls
+	o.FlushInterval = time.Hour
+	o.WriteTimeout = time.Minute
+	l := async.New(w, o)
+
+	// trigger a flush: the consumer enters WriteLog and blocks on the gate.
+	l.Info("b1")
+	l.Info("b2")
+	w.waitBlocked(t)
+
+	// a send to a non-full channel must return immediately.
 	start := time.Now()
-	for i := 0; i < 100; i++ {
-		l.Infof("log %d", i)
+	l.Info("fast")
+	if d := time.Since(start); d > 10*time.Millisecond {
+		t.Errorf("send to non-full channel should be non-blocking, took %v", d)
 	}
-	if time.Since(start) > 10*time.Millisecond {
-		t.Errorf("writes should be non-blocking, took %v", time.Since(start))
+
+	// fill the channel to capacity, then one more: it must NOT block (drop path).
+	for i := 0; i < 8; i++ {
+		l.Info("fill")
+	}
+	start = time.Now()
+	l.Info("overflow-dropped")
+	if d := time.Since(start); d > 10*time.Millisecond {
+		t.Errorf("send to full channel should be non-blocking (drop), took %v", d)
+	}
+
+	close(gate)
+	l.Close()
+	// the overflow message was dropped, so it must be absent from output;
+	// this proves the drop path was actually taken rather than enqueued.
+	if has(w.get(), "overflow-dropped") {
+		t.Errorf("overflow message should have been dropped, got %q", w.get())
 	}
 }
 
@@ -78,16 +109,26 @@ func TestBatchWrite(t *testing.T) {
 	w := &mockWriter{}
 	o := opts()
 	o.BatchSize = 10
+	o.FlushInterval = time.Hour // disable ticker so only BatchSize/explicit Flush writes
 	l := async.New(w, o)
-	defer l.Close()
 	for i := 0; i < 25; i++ {
 		l.Infof("log %d", i)
 	}
-	time.Sleep(200 * time.Millisecond)
-	l.Flush()
-	if w.get() == "" {
-		t.Error("expected content")
+	if err := l.Flush(); err != nil {
+		t.Fatal(err)
 	}
+	c := w.get()
+	// every message must survive
+	for i := 0; i < 25; i++ {
+		if !has(c, fmt.Sprintf("log %d", i)) {
+			t.Errorf("message log %d missing in %q", i, c)
+		}
+	}
+	// batching must have occurred: 25 msgs / BatchSize 10 => 3 writes (10+10+5)
+	if got := w.cnt(); got != 3 {
+		t.Errorf("expected 3 batched writes, got %d", got)
+	}
+	l.Close()
 }
 
 func TestCloseFlushes(t *testing.T) {
@@ -126,25 +167,77 @@ func TestGracefulShutdown(t *testing.T) {
 	}
 }
 
+// gatedWriter blocks every WriteLog until gate is closed, so the consumer
+// goroutine stalls inside flushBatch and the channel can be overflowed
+// deterministically. It records how many calls are currently blocked so the
+// test can wait until the stall actually happens.
+type gatedWriter struct {
+	mu      sync.Mutex
+	content string
+	gate    chan struct{}
+	blocked int32
+}
+
+func (g *gatedWriter) WriteLog(ctx context.Context, c string) error {
+	atomic.AddInt32(&g.blocked, 1)
+	<-g.gate
+	atomic.AddInt32(&g.blocked, -1)
+	g.mu.Lock()
+	g.content += c
+	g.mu.Unlock()
+	return nil
+}
+
+func (g *gatedWriter) get() string { g.mu.Lock(); defer g.mu.Unlock(); return g.content }
+
+// waitBlocked fails the test if the consumer never enters WriteLog.
+func (g *gatedWriter) waitBlocked(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt32(&g.blocked) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for consumer to block in WriteLog")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestOverflowWarning(t *testing.T) {
-	w := &mockWriter{delay: 200 * time.Millisecond}
+	gate := make(chan struct{})
+	w := &gatedWriter{gate: gate}
 	o := opts()
-	o.ChannelBufferCount = 100
-	o.BatchSize = 50
+	o.ChannelBufferCount = 4
+	o.BatchSize = 2
+	o.FlushInterval = time.Hour  // disable ticker; only BatchSize/explicit Flush triggers writes
+	o.WriteTimeout = time.Minute // keep the gated WriteLog from timing out
 	l := async.New(w, o)
-	defer l.Close()
-	for i := 0; i < 1000; i++ {
-		l.Infof("log %d", i)
+
+	// 1) fill a batch so the consumer flushes and blocks inside WriteLog.
+	l.Info("batch-1")
+	l.Info("batch-2")
+	w.waitBlocked(t)
+
+	// 2) consumer is now stalled; overflow the channel. Capacity is 4, so
+	//    the first 4 of these enqueue and the rest are dropped.
+	for i := 0; i < 20; i++ {
+		l.Info("overflow-msg")
 	}
-	time.Sleep(500 * time.Millisecond)
-	l.Flush()
-	time.Sleep(200 * time.Millisecond)
+
+	// 3) release the writer. The next flush runs with droppedCount > 0 and
+	//    must prepend the overflow warning to the batch.
+	close(gate)
+	if err := l.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	l.Close()
+
 	c := w.get()
-	if c == "" {
-		t.Error("expected logs")
+	if !has(c, "[System Warning] Buffer overflow") {
+		t.Errorf("expected overflow warning in output, got %q", c)
 	}
-	if has(c, "[System Warning] Buffer overflow") {
-		t.Log("overflow warning present")
+	// the warning must report a non-zero dropped count (the feature's value).
+	if !has(c, "skipped ") || has(c, "skipped 0 logs") {
+		t.Errorf("expected non-zero skipped count in %q", c)
 	}
 }
 
@@ -162,12 +255,21 @@ func TestConcurrentWrites(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	l.Flush()
-	time.Sleep(200 * time.Millisecond)
+	if err := l.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	l.Close()
 	c := w.get()
-	if !has(c, "g0") || !has(c, "g9") {
-		t.Error("expected logs from all goroutines")
+	// every goroutine's output must be present (guards against a regression
+	// that drops entire goroutines).
+	for i := 0; i < 10; i++ {
+		if !has(c, fmt.Sprintf("g%d ", i)) {
+			t.Errorf("missing goroutine g%d in output", i)
+		}
+	}
+	// all 1000 messages must survive (each Infof line ends with \n)
+	if got := strings.Count(c, "\n"); got != 1000 {
+		t.Errorf("expected 1000 log lines, got %d", got)
 	}
 }
 
@@ -187,11 +289,15 @@ func TestScopedConcurrent(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	time.Sleep(300 * time.Millisecond)
+	l.Flush()
 	l.Close()
 	c := w.get()
-	if !has(c, "[test/w") {
-		t.Errorf("missing scope prefix in %q", c)
+	// every worker's nested scope must appear (a regression losing whole
+	// workers would otherwise pass with a single substring check).
+	for i := 0; i < 5; i++ {
+		if !has(c, fmt.Sprintf("[test/w%d]", i)) {
+			t.Errorf("missing scope [test/w%d] in %q", i, c)
+		}
 	}
 }
 
@@ -199,16 +305,20 @@ func TestRetry(t *testing.T) {
 	w := &mockWriter{failUntil: 2}
 	o := opts()
 	o.MaxRetry = 3
-	o.FlushInterval = 100 * time.Millisecond
+	o.FlushInterval = time.Hour // disable ticker: only explicit Flush writes
 	l := async.New(w, o)
 	l.Info("retry test")
-	time.Sleep(800 * time.Millisecond)
-	l.Flush()
-	time.Sleep(200 * time.Millisecond)
-	l.Close()
-	if w.get() == "" {
-		t.Error("expected log after retry")
+	// one batch, two transient failures then success: initial try + 2 retries = 3 attempts
+	if err := l.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
 	}
+	if !has(w.get(), "retry test") {
+		t.Errorf("expected log after retry, got %q", w.get())
+	}
+	if got := w.attemptsN(); got < 3 {
+		t.Errorf("expected at least 3 write attempts (1 try + retries), got %d", got)
+	}
+	l.Close()
 }
 
 func TestCloseNoPanic(t *testing.T) {
