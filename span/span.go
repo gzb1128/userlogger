@@ -1,9 +1,8 @@
-// Package span provides a simple timed Span implementation that logs
-// success/failure status with elapsed duration.
+// Package span 提供计时 Span，输出带耗时的成功/失败状态。
 //
-// # Usage
+// 用法（通常经由 *userlogger.Logger.StartSpan 间接使用）：
 //
-//	s := span.New(logger, "deploy application")
+//	s := span.New(logger, "部署应用")
 //	defer func() { if err != nil { s.End(err) } else { s.Done() } }()
 package span
 
@@ -11,23 +10,23 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gaozebin3/userlogger"
+	"github.com/gaozebin3/userlogger/internal/ulog"
 )
 
 type impl struct {
-	logger    userlogger.UserLogger
+	logger    ulog.UserLogger
 	name      string
 	startTime time.Time
 }
 
-// New creates a Span that starts timing immediately.
-func New(logger userlogger.UserLogger, name string) userlogger.Span {
+// New 创建立即开始计时的 Span。
+func New(logger ulog.UserLogger, name string) ulog.Span {
 	return &impl{logger: logger, name: name, startTime: time.Now()}
 }
 
-// End completes the span:
-//   - success: "✓ <name> done (<duration>)"
-//   - failure: "✗ <name> failed (<duration>): <err>"
+// End 结束 span：
+//   - 成功："✓ <name> done (<duration>)"
+//   - 失败："✗ <name> failed (<duration>): <err>"
 func (s *impl) End(err error) {
 	d := time.Since(s.startTime)
 	if err != nil {
@@ -39,8 +38,7 @@ func (s *impl) End(err error) {
 
 func (s *impl) Done() { s.End(nil) }
 
-// formatDuration renders a human-friendly duration:
-// <1s → "500ms", <1m → "1.2s", ≥1m → "2.5m".
+// formatDuration 友好时长：<1s → "500ms"，<1m → "1.2s"，≥1m → "2.5m"。
 func formatDuration(d time.Duration) string {
 	if d < time.Second {
 		return fmt.Sprintf("%dms", d.Milliseconds())

@@ -1,231 +1,157 @@
-// Package userlogger provides high-performance, extensible user-facing logging
-// built on top of klog.
+// Package userlogger 提供面向终端用户的操作日志：类 shell 终端的简洁文本流，
+// 落库后供最终用户查看；同时把每条用户日志选择性地镜像写入 klog（运维侧）。
 //
-// # Quick Start
+// 两类受众、两种格式：
+//   - 用户（本包）：简单文本，不带内部上下文（pin/traceID 等）。
+//   - 运维（klog）：结构化、带完整上下文；klog 自身的直接调用不会进入用户 dst。
 //
-// Assuming ctx already carries a UserLogger (see Context below):
+// # 快速开始
+//
+// 假设 ctx 已携带 UserLogger（见下文 Context）：
 //
 //	ul := userlogger.FromContext(ctx)
-//	ul.Info("starting deployment")        // structured, with timestamp
-//	ul.Logf("deployed %d instances", 10)   // formatted, no timestamp
-//	ul.Log("intermediate output")          // plain text, no timestamp
-//	ul.Error("deployment failed")          // error, with timestamp
+//	ul.Info("starting deployment")         // 带时间戳
+//	ul.Logf("deployed %d instances", 10)    // 不带时间戳
+//	ul.Log("intermediate output")           // 纯文本
+//	ul.Error("deployment failed")           // 带时间戳错误
 //
-// # Scope — Group Logs by Business Context
+// # Scope —— 按业务上下文分组
 //
-// Use WithScope to add a [scope] prefix so logs from different modules or
-// concurrent tasks are distinguishable.  Scope depth should be kept to 2–3 levels.
+//	deploy := ul.WithScope("service-deploy/order-service")
+//	env := deploy.WithScope("env-setup")    // 第三层，建议保持 2-3 层
 //
-//	deployLogger := ul.WithScope("service-deploy/order-service")
-//	envLogger := deployLogger.WithScope("env-setup")  // 3rd level — keep it shallow
+// 用业务语义命名（动作/对象），而非内部代码路径。
 //
-// Name scopes with business semantics (action/object), not internal code paths:
-//
-//	Good:  "service-deploy/payment-api", "Helm/order-service", "middleware/MySQL"
-//	Bad:   "cvessel/chart/order-api", "handler/step-1"
-//
-// # Span — Track Operation Duration
-//
-// Use StartSpan for business-meaningful operations that take >1 s.
-// Call Done() on success, End(err) on failure.
+// # Span —— 跟踪操作耗时
 //
 //	span := ul.StartSpan("deploy application")
 //	defer func() { if err != nil { span.End(err) } else { span.Done() } }()
 //
 // # Context
 //
-//	// Inject
-//	logger := async.New(writer, async.DefaultOptions())
+//	// 注入：base 通常为 async.AsyncLogger
 //	ctx = userlogger.NewContext(ctx, logger)
 //
-//	// Retrieve — returns no-op if absent, dual-writes to klog if present
+//	// 取出：若无 UserLogger 返回 no-op；若 ctx 同时含 klog.Logger，则返回
+//	// 会镜像写入 klog 的 *Logger。
 //	ul := userlogger.FromContext(ctx)
 //
-// # Sub-packages
+// # 子包
 //
-//   - scoped:  ScopedUserLogger — scope prefix decorator
-//   - span:    timed Span implementation
-//   - async:   AsyncLogger — channel-based non-blocking writer with LogWriter interface
+//   - scoped: scope 前缀装饰器
+//   - span:   计时 span
+//   - async:  基于 channel 的非阻塞批量 writer（LogWriter 接口）
 package userlogger
 
 import (
 	"context"
 	"fmt"
-	"strings"
-	"time"
 
+	"github.com/gaozebin3/userlogger/internal/ulog"
+	"github.com/gaozebin3/userlogger/scoped"
+	"github.com/gaozebin3/userlogger/span"
 	"github.com/go-logr/logr"
 	"k8s.io/klog/v2"
 )
 
-// UserLogger is the core interface for user-facing business logs.
-//
-// Two output categories:
-//   - Unstructured (Log/Logf): plain text, no timestamp.  For intermediate output.
-//   - Structured (Info/Infof/Error/Errorf): with timestamp.  For key steps and errors.
-type UserLogger interface {
-	Log(message string)
-	Logf(format string, args ...interface{})
-	Info(message string)
-	Infof(format string, args ...interface{})
-	Error(message string)
-	Errorf(format string, args ...interface{}) error
-	Flush() error
-	WithScope(scope string) UserLogger
-	StartSpan(name string) Span
-}
+// UserLogger 是面向终端用户的日志接口（ulog.UserLogger 的别名，方法集定义在 internal/ulog）。
+// WithScope/StartSpan 不在接口上：它们由 FromContext 返回的 *Logger 提供，
+// 因此后端只需实现 UserLogger 的输出方法（见 internal/ulog/ulog.go）。
+type UserLogger = ulog.UserLogger
 
-// Span tracks the duration and outcome of an operation.
-type Span interface {
-	End(err error)
-	Done()
-}
+// Span 跟踪一次操作的耗时与成败。
+type Span = ulog.Span
 
 type ctxKey struct{}
 
 var contextKey = ctxKey{}
 
-// FromContext retrieves a UserLogger from ctx.
-// Returns no-op if absent.  If ctx also contains a klog.Logger, returns a
-// dual-write wrapper.
-func FromContext(ctx context.Context) UserLogger {
-	ul, _ := ctx.Value(contextKey).(UserLogger)
-	if ul == nil {
-		ul = &noopUserLogger{}
-	}
-	if _, err := logr.FromContext(ctx); err == nil {
-		return &klogUserLogger{base: ul, klogger: klog.FromContext(ctx)}
-	}
-	return ul
+// Logger 是面向调用方的门面类型，由 FromContext 构造。它在 sink 之上提供
+// WithScope/StartSpan 链式调用；sink 可能是 async 后端，或包了一层 klog 镜像。
+type Logger struct {
+	sink ulog.UserLogger
 }
 
-// NewContext returns a ctx carrying the given UserLogger.
+func (l *Logger) Log(message string)                      { l.sink.Log(message) }
+func (l *Logger) Logf(format string, args ...any)         { l.sink.Logf(format, args...) }
+func (l *Logger) Info(message string)                     { l.sink.Info(message) }
+func (l *Logger) Infof(format string, args ...any)        { l.sink.Infof(format, args...) }
+func (l *Logger) Error(message string)                    { l.sink.Error(message) }
+func (l *Logger) Errorf(format string, args ...any) error { return l.sink.Errorf(format, args...) }
+func (l *Logger) Flush() error                            { return l.sink.Flush() }
+
+// WithScope 返回一个带 scope 前缀的新 *Logger。连续调用会把 scope 段拼接成
+// [a/b/c]（而非嵌套的多个括号）。原 Logger 不受影响（不可变）。
+func (l *Logger) WithScope(scope string) *Logger {
+	if sc, ok := l.sink.(*scoped.ScopedUserLogger); ok {
+		return &Logger{sink: sc.Append(scope)}
+	}
+	return &Logger{sink: scoped.New(l.sink, scope)}
+}
+
+// StartSpan 创建计时 span；输出经由当前 sink（含 scope 与 klog 镜像）。
+func (l *Logger) StartSpan(name string) Span {
+	return span.New(l.sink, name)
+}
+
+// FromContext 从 ctx 取出 UserLogger 并返回门面 *Logger。
+// 若 ctx 无 UserLogger，使用 no-op；若 ctx 同时含 klog.Logger，sink 会额外镜像写入 klog。
+func FromContext(ctx context.Context) *Logger {
+	base, _ := ctx.Value(contextKey).(ulog.UserLogger)
+	if base == nil {
+		base = noopUserLogger{}
+	}
+	sink := base
+	if _, err := logr.FromContext(ctx); err == nil {
+		sink = &klogMirror{base: base, klogger: klog.FromContext(ctx)}
+	}
+	return &Logger{sink: sink}
+}
+
+// NewContext 返回携带给定 UserLogger 的 ctx。
 func NewContext(ctx context.Context, ul UserLogger) context.Context {
 	return context.WithValue(ctx, contextKey, ul)
 }
 
-// --- no-op implementations ---
-
-func newSpan(logger UserLogger, name string) Span {
-	return &spanImpl{logger: logger, name: name, start: time.Now()}
-}
+// --- no-op ---
 
 type noopUserLogger struct{}
 
-func (n *noopUserLogger) Log(string)                              {}
-func (n *noopUserLogger) Logf(string, ...interface{})             {}
-func (n *noopUserLogger) Info(string)                             {}
-func (n *noopUserLogger) Infof(string, ...interface{})            {}
-func (n *noopUserLogger) Error(string)                            {}
-func (n *noopUserLogger) Errorf(f string, a ...interface{}) error { return fmt.Errorf(f, a...) }
-func (n *noopUserLogger) Flush() error                            { return nil }
-func (n *noopUserLogger) WithScope(string) UserLogger             { return n }
-func (n *noopUserLogger) StartSpan(string) Span                   { return &noopSpan{} }
+func (noopUserLogger) Log(string)                      {}
+func (noopUserLogger) Logf(string, ...any)             {}
+func (noopUserLogger) Info(string)                     {}
+func (noopUserLogger) Infof(string, ...any)            {}
+func (noopUserLogger) Error(string)                    {}
+func (noopUserLogger) Errorf(f string, a ...any) error { return fmt.Errorf(f, a...) }
+func (noopUserLogger) Flush() error                    { return nil }
 
-type noopSpan struct{}
+var _ ulog.UserLogger = noopUserLogger{}
 
-func (n *noopSpan) End(error) {}
-func (n *noopSpan) Done()     {}
+// --- klog 镜像（单向：用户日志 → klog；klog 直接调用不进用户 dst）---
 
-// --- klog dual-write wrapper ---
-
-type klogUserLogger struct {
-	base    UserLogger
+// klogMirror 把每条输出同时写入 base（用户 dst）与 klog（运维）。
+// 它只实现输出方法：scope/span 由 *Logger 在其外层套用，故此处无重复实现。
+type klogMirror struct {
+	base    ulog.UserLogger
 	klogger klog.Logger
 }
 
-func (k *klogUserLogger) Log(m string) { k.klogger.Info(m); k.base.Log(m) }
-func (k *klogUserLogger) Logf(f string, a ...interface{}) {
+func (k *klogMirror) Log(m string) { k.klogger.Info(m); k.base.Log(m) }
+func (k *klogMirror) Logf(f string, a ...any) {
 	k.klogger.Info(fmt.Sprintf(f, a...))
 	k.base.Logf(f, a...)
 }
-func (k *klogUserLogger) Info(m string) { k.klogger.Info(m); k.base.Info(m) }
-func (k *klogUserLogger) Infof(f string, a ...interface{}) {
+func (k *klogMirror) Info(m string) { k.klogger.Info(m); k.base.Info(m) }
+func (k *klogMirror) Infof(f string, a ...any) {
 	k.klogger.Info(fmt.Sprintf(f, a...))
 	k.base.Infof(f, a...)
 }
-func (k *klogUserLogger) Error(m string) { k.klogger.Error(nil, m); k.base.Error(m) }
-func (k *klogUserLogger) Errorf(f string, a ...interface{}) error {
+func (k *klogMirror) Error(m string) { k.klogger.Error(nil, m); k.base.Error(m) }
+func (k *klogMirror) Errorf(f string, a ...any) error {
 	err := fmt.Errorf(f, a...)
 	k.klogger.Error(nil, err.Error())
 	return k.base.Errorf(f, a...)
 }
-func (k *klogUserLogger) Flush() error { return k.base.Flush() }
-func (k *klogUserLogger) WithScope(s string) UserLogger {
-	return &klogScoped{base: k, scopes: []string{s}}
-}
-func (k *klogUserLogger) StartSpan(n string) Span { return newSpan(k, n) }
+func (k *klogMirror) Flush() error { return k.base.Flush() }
 
-var _ UserLogger = (*klogUserLogger)(nil)
-
-// --- span for root package (avoids circular import) ---
-
-type spanImpl struct {
-	logger UserLogger
-	name   string
-	start  time.Time
-}
-
-func (s *spanImpl) End(err error) {
-	d := time.Since(s.start)
-	if err != nil {
-		s.logger.Errorf("✗ %s failed (%s): %v", s.name, fmtDur(d), err)
-	} else {
-		s.logger.Infof("✓ %s done (%s)", s.name, fmtDur(d))
-	}
-}
-func (s *spanImpl) Done() { s.End(nil) }
-
-func fmtDur(d time.Duration) string {
-	if d < time.Second {
-		return fmt.Sprintf("%dms", d.Milliseconds())
-	} else if d < time.Minute {
-		return fmt.Sprintf("%.1fs", d.Seconds())
-	}
-	return fmt.Sprintf("%.1fm", d.Minutes())
-}
-
-var _ Span = (*spanImpl)(nil)
-
-// klogScoped carries scope prefixes under the klog dual-write mode.
-type klogScoped struct {
-	base   *klogUserLogger
-	scopes []string
-}
-
-func (s *klogScoped) Log(m string)                     { s.base.Log(s.pfx(m)) }
-func (s *klogScoped) Logf(f string, a ...interface{})  { s.base.Log(s.pfx(fmt.Sprintf(f, a...))) }
-func (s *klogScoped) Info(m string)                    { s.base.Info(s.pfx(m)) }
-func (s *klogScoped) Infof(f string, a ...interface{}) { s.base.Info(s.pfx(fmt.Sprintf(f, a...))) }
-func (s *klogScoped) Error(m string)                   { s.base.Error(s.pfx(m)) }
-func (s *klogScoped) Errorf(f string, a ...interface{}) error {
-	p := s.scope()
-	if p == "" {
-		return s.base.Errorf(f, a...)
-	}
-	return s.base.Errorf("%s %w", p, fmt.Errorf(f, a...))
-}
-func (s *klogScoped) Flush() error { return s.base.Flush() }
-func (s *klogScoped) WithScope(scope string) UserLogger {
-	ns := make([]string, len(s.scopes)+1)
-	copy(ns, s.scopes)
-	ns[len(s.scopes)] = scope
-	return &klogScoped{base: s.base, scopes: ns}
-}
-func (s *klogScoped) StartSpan(n string) Span { return newSpan(s, n) }
-
-func (s *klogScoped) pfx(m string) string {
-	if p := s.scope(); p != "" {
-		return p + " " + m
-	}
-	return m
-}
-
-func (s *klogScoped) scope() string {
-	if len(s.scopes) == 0 {
-		return ""
-	}
-	return "[" + strings.Join(s.scopes, "/") + "]"
-}
-
-var _ UserLogger = (*klogScoped)(nil)
+var _ ulog.UserLogger = (*klogMirror)(nil)
