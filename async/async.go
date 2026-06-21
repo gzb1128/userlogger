@@ -26,9 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gaozebin3/userlogger"
-	"github.com/gaozebin3/userlogger/scoped"
-	"github.com/gaozebin3/userlogger/span"
+	"github.com/gaozebin3/userlogger/internal/ulog"
 	"k8s.io/klog/v2"
 )
 
@@ -172,14 +170,6 @@ func (l *AsyncLogger) Errorf(f string, a ...interface{}) error {
 	err := fmt.Errorf(f, a...)
 	l.sendLog("[" + time.Now().Format(tsLayout) + "] ❌ " + err.Error())
 	return err
-}
-
-func (l *AsyncLogger) WithScope(scope string) userlogger.UserLogger {
-	return scoped.New(l, scope)
-}
-
-func (l *AsyncLogger) StartSpan(name string) userlogger.Span {
-	return span.New(l, name)
 }
 
 func (l *AsyncLogger) consumerLoop() {
@@ -331,4 +321,4 @@ func (l *AsyncLogger) Close() error {
 	return l.closeErr
 }
 
-var _ userlogger.UserLogger = (*AsyncLogger)(nil)
+var _ ulog.UserLogger = (*AsyncLogger)(nil)
